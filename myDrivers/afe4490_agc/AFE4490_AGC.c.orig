@@ -1,0 +1,504 @@
+#include "AFE4490_AGC.h"
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* 定义 PI */
+#ifndef PI
+#define PI 3.14159265358979f
+#endif
+
+AFE4490_AGC agc;
+
+/* ================= DSP 静态资源 ================= */
+static arm_rfft_fast_instance_f32 fft_inst;
+static float fft_in[FFT_SIZE];
+static float fft_out[FFT_SIZE];
+static float fft_mag[FFT_SIZE / 2];
+static float hann_win[FFT_SIZE];
+static float nsdf_buf[FFT_SIZE];
+
+/* ================= 全局增益缓存 (用于物理计算) ================= */
+float g_pga_ir_val = 1.0f;
+float g_pga_red_val = 1.0f;
+float R_pga_ir_val = 0.1f; // 单位 kOhm 或相对值，根据实际电阻表修改
+float R_pga_red_val = 0.1f;
+
+/* ================= 内部函数声明 ================= */
+static uint8_t calc_ambdac(int32_t dc_adc);
+static float calc_snr(int32_t *buf, int32_t dc);
+static float calc_corr_nsdf(int32_t *buf, int32_t dc);
+static uint8_t led_ma_to_code(float ma);
+static void init_hann_window(void);
+
+static void Calculate_Physics_And_Coeff(int32_t ir_raw, int32_t red_raw);
+static void State_Standby_Handler(int32_t ir_raw, int32_t red_raw);
+static void State_Flash_Handler(int32_t ir_raw, int32_t red_raw);
+static void State_Tuning_Handler(int32_t ir_raw, int32_t red_raw);
+static void State_Locked_Handler(int32_t ir_raw, int32_t red_raw);
+static void Reset_To_Standby(void);
+static void Update_Hardware_Full(void);
+static void Update_Gain_Params(void);
+
+/* ================= 初始化 ================= */
+void agc_init(void)
+{
+    arm_rfft_fast_init_f32(&fft_inst, FFT_SIZE);
+    init_hann_window();
+    Reset_To_Standby();
+}
+
+static void init_hann_window(void)
+{
+    for (int i = 0; i < FFT_SIZE; i++)
+    {
+        hann_win[i] = 0.5f * (1.0f - arm_cos_f32(2.0f * PI * i / (FFT_SIZE - 1)));
+    }
+}
+
+/* 统一硬件更新 */
+static void Update_Hardware_Full(void)
+{
+    afe_adjust(1, agc.ir_pga, 1, agc.red_pga, 
+               led_ma_to_code(agc.led_ir_ma), 
+               led_ma_to_code(agc.led_red_ma), 
+               agc.ambdac_code);
+    
+    Update_Gain_Params();
+}
+
+static void Reset_To_Standby(void)
+{
+    agc.state = AGC_STATE_STANDBY;
+    agc.sub_state = tune_IDLE;
+    
+    /* 3mA 常亮待机配置 */
+    agc.led_ir_ma = 3.0f;
+    agc.led_red_ma = 3.0f;
+    agc.ir_pga = PGA_1X;
+    agc.red_pga = PGA_1X;
+    agc.ambdac_code = 1; 
+    
+    /* 清空计算缓存 */
+    memset(agc.ir_history, 0, sizeof(agc.ir_history));
+    memset(agc.red_history, 0, sizeof(agc.red_history));
+    agc.buf_idx = 0;
+    agc.buf_filled = false;
+    agc.locked_coeff = 0;
+    
+    Update_Hardware_Full();
+}
+
+/* 根据枚举更新计算用的物理参数 */
+static void Update_Gain_Params(void)
+{
+    switch(agc.ir_pga) {
+        case PGA_1X:   g_pga_ir_val = 1.0f; R_pga_ir_val=0.1f; break;
+        case PGA_1_5X: g_pga_ir_val = 1.5f; R_pga_ir_val=0.15f; break;
+        case PGA_2X:   g_pga_ir_val = 2.0f; R_pga_ir_val=0.2f; break;
+        case PGA_3X:   g_pga_ir_val = 3.0f; R_pga_ir_val=0.3f; break;
+        case PGA_4X:   g_pga_ir_val = 4.0f; R_pga_ir_val=0.4f; break;
+        default:       g_pga_ir_val = 1.0f; R_pga_ir_val=0.1f; break;
+    }
+    switch(agc.red_pga) {
+        case PGA_1X:   g_pga_red_val = 1.0f; R_pga_red_val=0.1f; break;
+        case PGA_1_5X: g_pga_red_val = 1.5f; R_pga_red_val=0.15f; break;
+        case PGA_2X:   g_pga_red_val = 2.0f; R_pga_red_val=0.2f; break;
+        case PGA_3X:   g_pga_red_val = 3.0f; R_pga_red_val=0.3f; break;
+        case PGA_4X:   g_pga_red_val = 4.0f; R_pga_red_val=0.4f; break;
+        default:       g_pga_red_val = 1.0f; R_pga_red_val=0.1f; break;
+    }
+}
+
+/* ================= 核心逻辑：采样点驱动 ================= */
+void agc_push_sample(int32_t ir_raw, int32_t red_raw)
+{
+    /* 1. 物理量计算 (Flash 模式下跳过以节省算力) */
+    if (agc.state != AGC_STATE_FLASH) {
+        Calculate_Physics_And_Coeff(ir_raw, red_raw);
+    }
+
+    /* 2. 顶层状态机 */
+    switch (agc.state) {
+        case AGC_STATE_STANDBY: 
+            State_Standby_Handler(ir_raw, red_raw); 
+            break;
+        case AGC_STATE_FLASH:   
+            State_Flash_Handler(ir_raw, red_raw);   
+            break;
+        case AGC_STATE_TUNING:  
+            State_Tuning_Handler(ir_raw, red_raw);  
+            break;
+        case AGC_STATE_LOCKED:  
+            State_Locked_Handler(ir_raw, red_raw);  
+            break;
+    }
+}
+
+/* ================= 物理量与系数计算 ================= */
+static void Calculate_Physics_And_Coeff(int32_t ir_raw, int32_t red_raw)
+{
+    Update_Gain_Params();
+
+    /* 1. 还原真实 ADC 值 (Restore Raw Logic) */
+    int32_t ir_true  = (int32_t)((float)ir_raw + 2.0*(double)agc.ambdac_code*(double)R_pga_ir_val/0.000000572);
+    int32_t red_true = (int32_t)((float)red_raw + 2.0*(double)agc.ambdac_code*(double)R_pga_red_val/0.000000572);
+
+    /* 2. 转换为纳安 (nA) */
+    float Iir_true_nA  = ((float)ir_true * 0.000000572f) / (2.0f * g_pga_ir_val * 250000.0f) * 1e9f;
+    float Ired_true_nA = ((float)red_true * 0.000000572f) / (2.0f * g_pga_red_val * 250000.0f) * 1e9f;
+
+// 初始化
+float ir_sum = 0;
+float red_sum = 0;
+
+// 更新
+ir_sum -= agc.ir_history[agc.buf_idx];
+red_sum -= agc.red_history[agc.buf_idx];
+
+agc.ir_history[agc.buf_idx] = Iir_true_nA;
+agc.red_history[agc.buf_idx] = Ired_true_nA;
+
+ir_sum += Iir_true_nA;
+red_sum += Ired_true_nA;
+
+agc.buf_idx++;
+if (agc.buf_idx >= AVG_WIN_SIZE) {
+    agc.buf_idx = 0;
+    agc.buf_filled = true;
+}
+
+uint32_t len = agc.buf_filled ? AVG_WIN_SIZE : agc.buf_idx;
+if (len == 0) len = 1;
+
+agc.final_ir_avg  = ir_sum  / len;
+agc.final_red_avg = red_sum / len;
+
+
+    /* 4. 吸光系数计算 */
+    float a = agc.led_ir_ma < 0.1f ? 0.1f : agc.led_ir_ma;
+    float b = agc.led_red_ma < 0.1f ? 0.1f : agc.led_red_ma;
+    
+    float Ir1 = agc.final_ir_avg / (a * 1000000.0f);
+    float RED1 = agc.final_red_avg / (b * 1000000.0f);
+    
+    if (Ir1 <= 1e-4f) Ir1 = 1e-4f;
+    if (RED1 <= 1e-4f) RED1 = 1e-4f;
+
+    float ln_ir, ln_red;
+    arm_vlog_f32(&Ir1, &ln_ir, 1);
+    arm_vlog_f32(&RED1, &ln_red, 1);
+
+    if (fabsf(ln_ir) < 1e-5f) ln_ir = 1e-5f;
+    agc.current_ln2 = (ln_red / ln_ir) * 10000.0f;
+}
+
+/* ================= 状态机逻辑 ================= */
+
+static void State_Standby_Handler(int32_t ir_raw, int32_t red_raw)
+{
+    bool ir_sat = (ir_raw >= SATURATION_THRES);
+    bool red_sat = (red_raw >= SATURATION_THRES);
+
+    /* A. 两路饱和 -> 进 Flash 模式 */
+    if (ir_sat && red_sat) {
+        agc.state = AGC_STATE_FLASH;
+        agc.flash_counter = 0;
+        /* 关灯，进入闪光监测周期 */
+        afe_adjust(1, agc.ir_pga, 1, agc.red_pga, 0, 0, agc.ambdac_code);
+        return;
+    }
+
+    /* B. 半饱和 -> 维持现状等待 */
+    if (ir_sat || red_sat) return;
+
+    /* C. 不饱和 -> 判断吸光系数 (判定是否为手指) */
+    if (agc.buf_filled) {
+        /* 如果系数在空气范围内 (9000~11000)，维持 Standby */
+        if (agc.current_ln2 >= COEFF_AIR_MIN && agc.current_ln2 <= COEFF_AIR_MAX) {
+            return; 
+        } 
+        /* 系数异常 (发现手指) -> 启动 AGC Tuning */
+        else {
+            agc.state = AGC_STATE_TUNING;
+            agc.sub_state = tune_LED_DC_ADJUST;
+            
+            /* Tuning 初始化: 1X增益, 5mA, AmbDAC=0 */
+            agc.ir_pga = PGA_1X;
+            agc.red_pga = PGA_1X;
+            agc.ambdac_code = 0; 
+            agc.led_ir_ma = 10.0f; 
+            agc.led_red_ma = 10.0f;
+            
+            agc.dc_count = 0;
+            agc.dc_sum_ir = 0;
+            agc.dc_sum_red = 0;
+            agc.dc_adjust_timeout = 0; 
+            
+            Update_Hardware_Full();
+        }
+    }
+}
+
+static void State_Flash_Handler(int32_t ir_raw, int32_t red_raw)
+{
+    /* 125Hz 采样, 1秒=125点 */
+    
+    if (agc.flash_counter == 0) {
+        /* 第0点: 开灯 (3mA) */
+        afe_adjust(1, PGA_1X, 1, PGA_1X, led_ma_to_code(3.0f), led_ma_to_code(3.0f), 1);
+    }
+    else if (agc.flash_counter == 4) {
+        /* 第4点 (约32ms后): 采样并判断饱和 */
+        bool sat = (ir_raw >= SATURATION_THRES) && (red_raw >= SATURATION_THRES);
+        
+        /* 无论结果如何，先关灯省电 */
+        afe_adjust(1, PGA_1X, 1, PGA_1X, 0, 0, 1);
+        
+        if (!sat) {
+            /* 不饱和了 -> 有物体遮挡 -> 重置回 Standby 常亮监测 */
+            Reset_To_Standby();
+            return;
+        }
+    }
+    
+    agc.flash_counter++;
+    if (agc.flash_counter >= (uint16_t)SAMPLE_RATE_HZ) {
+        agc.flash_counter = 0; /* 1秒结束，重置循环 */
+    }
+}
+
+/* 原有 AGC 逻辑的完整封装 */
+static void State_Tuning_Handler(int32_t ir_raw, int32_t red_raw)
+{
+    /* 保护: 调节过程中任何时刻饱和，直接复位 */
+    if (ir_raw >= SATURATION_THRES || red_raw >= SATURATION_THRES) {
+        Reset_To_Standby();
+        return;
+    }
+
+    /* 收集 DC 数据 (保持原逻辑使用平均值) */
+    if (agc.sub_state == tune_LED_DC_ADJUST) {
+        agc.dc_sum_ir += ir_raw;
+        agc.dc_sum_red += red_raw;
+        agc.dc_count++;
+        
+        /* 攒够数据点 (原 DC_WIN_SIZE=64 假设) */
+        /* 这里简化，直接逐点调节或使用小窗口，根据原逻辑 P 调节通常不需要大窗口平均，直接用 raw 即可 */
+        /* 为了严格匹配原逻辑，我们使用单点 RAW 进行 P 调节，因为原代码 agc.dc_ir 是平均值 */
+        /* 为保持一致，这里每点都运行 P 调节 */
+        agc.dc_ir = ir_raw;
+        agc.dc_red = red_raw;
+    }
+
+    switch (agc.sub_state) {
+        
+        /* 1. DC 调节 (P控制) */
+        case tune_LED_DC_ADJUST: {
+            int32_t err_ir  = DC_TARGET_ADC - agc.dc_ir;
+            int32_t err_red = DC_TARGET_ADC - agc.dc_red;
+
+            float d_ir  = DC_KP_MA_PER_ADC * (float)err_ir;
+            float d_red = DC_KP_MA_PER_ADC * (float)err_red;
+
+            /* 限幅步进 */
+            if (d_ir >  LED_CURR_STEP_MA) d_ir =  LED_CURR_STEP_MA;
+            if (d_ir < -LED_CURR_STEP_MA) d_ir = -LED_CURR_STEP_MA;
+            if (d_red >  LED_CURR_STEP_MA) d_red =  LED_CURR_STEP_MA;
+            if (d_red < -LED_CURR_STEP_MA) d_red = -LED_CURR_STEP_MA;
+
+            agc.led_ir_ma  += d_ir;
+            agc.led_red_ma += d_red;
+
+            /* 限幅绝对值 */
+            if (agc.led_ir_ma < LED_CURR_MIN_MA) agc.led_ir_ma = LED_CURR_MIN_MA;
+            if (agc.led_ir_ma > LED_CURR_MAX_MA) agc.led_ir_ma = LED_CURR_MAX_MA;
+            if (agc.led_red_ma < LED_CURR_MIN_MA) agc.led_red_ma = LED_CURR_MIN_MA;
+            if (agc.led_red_ma > LED_CURR_MAX_MA) agc.led_red_ma = LED_CURR_MAX_MA;
+
+            Update_Hardware_Full();
+
+            /* 判断收敛或边界 */
+            bool converged = (abs(err_ir) < DC_TOL_ADC) && (abs(err_red) < DC_TOL_ADC);
+            bool railed = (agc.led_ir_ma >= LED_CURR_MAX_MA) || (agc.led_ir_ma <= LED_CURR_MIN_MA);
+
+            agc.dc_adjust_timeout++;
+            
+            /* 如果收敛 或 达到边界 或 超时，进入下一步 */
+            if (converged || railed || agc.dc_adjust_timeout > 100) {
+                agc.sub_state = tune_AMBDAC_CALC;
+            }
+            break;
+        }
+
+        /* 2. AmbDAC 计算 */
+        case tune_AMBDAC_CALC: {
+            /* 简单使用当前值计算 */
+            agc.ambdac_code = calc_ambdac((ir_raw + red_raw) / 2);
+            Update_Hardware_Full();
+            
+            agc.wait_counter = 0;
+            agc.sub_state = tune_WAIT_STABLE;
+            break;
+        }
+
+        /* 3. 等待硬件稳定 */
+        case tune_WAIT_STABLE: {
+            if (++agc.wait_counter > 20) { // 160ms
+                agc.fft_idx = 0;
+                agc.fft_count = 0;
+                agc.sub_state = tune_FFT_COLLECT;
+            }
+            break;
+        }
+
+        /* 4. FFT 数据采集 */
+        case tune_FFT_COLLECT: {
+            agc.ir_fft_buf[agc.fft_idx]  = ir_raw;
+            agc.red_fft_buf[agc.fft_idx] = red_raw;
+            agc.fft_idx++;
+            if (agc.fft_idx >= FFT_SIZE) agc.fft_idx = 0;
+
+            agc.fft_count++;
+            if (agc.fft_count >= FFT_SIZE) {
+                agc.sub_state = tune_SNR_ADJUST;
+            }
+            break;
+        }
+
+        /* 5. SNR 计算与决策 */
+        case tune_SNR_ADJUST: {
+            agc.snr_ir  = calc_snr(agc.ir_fft_buf,  (int32_t)DC_TARGET_ADC);
+            agc.snr_red = calc_snr(agc.red_fft_buf, (int32_t)DC_TARGET_ADC);
+            agc.corr_ir  = calc_corr_nsdf(agc.ir_fft_buf,  (int32_t)DC_TARGET_ADC);
+            agc.corr_red = calc_corr_nsdf(agc.red_fft_buf, (int32_t)DC_TARGET_ADC);
+
+            if (agc.snr_ir < SNR_MIN_DB || agc.snr_red < SNR_MIN_DB)
+            {
+                /* 质量差 -> 增加增益并重试 (Robust Logic) */
+                if (agc.ir_pga < PGA_4X) {
+                    agc.ir_pga++;
+                    agc.red_pga++;
+                    agc.dc_adjust_timeout = 0;
+                    Update_Hardware_Full();
+                    agc.sub_state = tune_LED_DC_ADJUST; /* 回到 DC 调节 */
+                } else {
+                    /* 增益已最大 -> 强制锁定 */
+                    agc.locked = true;
+                    agc.state = AGC_STATE_LOCKED;
+                    agc.locked_snr_ir = agc.snr_ir;
+                    agc.locked_snr_red = agc.snr_red;
+                    
+                    agc.buf_idx = 0; // 重置物理量计算缓存
+                    agc.buf_filled = false;
+                }
+            }
+            else
+            {
+                /* 质量好 -> 锁定 */
+                agc.locked = true;
+                agc.state = AGC_STATE_LOCKED;
+                agc.locked_snr_ir = agc.snr_ir;
+                agc.locked_snr_red = agc.snr_red;
+                
+                agc.buf_idx = 0;
+                agc.buf_filled = false;
+            }
+            break;
+        }
+        default: break;
+    }
+}
+
+static void State_Locked_Handler(int32_t ir_raw, int32_t red_raw)
+{
+    /* 1. 饱和监测 */
+    if (ir_raw >= SATURATION_THRES || red_raw >= SATURATION_THRES) {
+        Reset_To_Standby();
+        return;
+    }
+
+    /* 2. 突变监测 */
+    if (!agc.buf_filled) return; 
+
+    /* 第一次稳定后记录基准 */
+    if (agc.locked_coeff == 0) {
+        agc.locked_coeff = agc.current_ln2;
+        return;
+    }
+
+    float diff = fabsf(agc.current_ln2 - agc.locked_coeff);
+    if (diff > COEFF_MUTATION_LIMIT) {
+        Reset_To_Standby();
+    }
+}
+
+/* ================= 辅助函数实现 ================= */
+
+static uint8_t led_ma_to_code(float ma)
+{
+    if (ma < 0) ma = 0;
+    return (uint8_t)((ma / 100.0f) * 255.0f + 0.5f);
+}
+
+static uint8_t calc_ambdac(int32_t dc_adc)
+{
+    float i_pd  = ((float)dc_adc / ADC_POS_FS) * 4.8f;
+    float i_amb = i_pd * AMBDAC_RATIO;
+    if (i_amb > AMBDAC_MAX_UA) i_amb = AMBDAC_MAX_UA;
+    if (i_amb < 0) i_amb = 0;
+    /* 假设线性映射 x10，请根据实际驱动调整 */
+    return (uint8_t)(i_amb * 10.0f + 0.5f); 
+}
+
+static float calc_snr(int32_t *buf, int32_t dc)
+{
+    for (int i = 0; i < FFT_SIZE; i++)
+        fft_in[i] = (float)(buf[i] - dc) * hann_win[i];
+
+    arm_rfft_fast_f32(&fft_inst, fft_in, fft_out, 0);
+    arm_cmplx_mag_f32(fft_out, fft_mag, FFT_SIZE / 2);
+
+    int bmin = (int)(HR_FREQ_MIN * (float)FFT_SIZE / SAMPLE_RATE_HZ);
+    int bmax = (int)(HR_FREQ_MAX * (float)FFT_SIZE / SAMPLE_RATE_HZ);
+
+    float sig = 0, noise = 0;
+    for (int i = 1; i < FFT_SIZE / 2; i++)
+    {
+        if (i >= bmin && i <= bmax)
+            sig += fft_mag[i];
+        else
+            noise += fft_mag[i];
+    }
+
+    if (noise < 1e-6f) noise = 1e-6f;
+    return 20.0f * log10f(sig / noise);
+}
+
+static float calc_corr_nsdf(int32_t *buf, int32_t dc)
+{
+    for (int i = 0; i < FFT_SIZE; i++)
+        nsdf_buf[i] = (float)(buf[i] - dc);
+
+    int lag_min = (int)(SAMPLE_RATE_HZ / HR_FREQ_MAX);
+    int lag_max = (int)(SAMPLE_RATE_HZ / HR_FREQ_MIN);
+
+    float best = 0.0f;
+    for (int lag = lag_min; lag <= lag_max; lag++)
+    {
+        float num = 0, den = 0;
+        for (int i = 0; i < FFT_SIZE - lag; i++)
+        {
+            float x1 = nsdf_buf[i];
+            float x2 = nsdf_buf[i + lag];
+            num += x1 * x2;
+            den += x1 * x1 + x2 * x2;
+        }
+        if (den > 1e-6f)
+        {
+            float v = 2.0f * num / den;
+            if (v > best) best = v;
+        }
+    }
+    return best;
+}

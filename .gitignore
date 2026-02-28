@@ -1,0 +1,16 @@
+# Keil generated files
+*.lst
+*.obj
+*.htm
+*.dep
+*.lnp
+*.build_log.htm
+*.map
+*.axf
+*.hex
+*.bin
+*.uvgui.*
+*.uvoptx
+# 文件夹
+Listings/
+Objects/
