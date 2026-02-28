@@ -1,10 +1,10 @@
 keil_project\calculate.o: ..\myDrivers\calculatepo2\calculate.c
 keil_project\calculate.o: ../Middlewares/ST/ARM/DSP/Inc/arm_math.h
 keil_project\calculate.o: ../Drivers/CMSIS/Include/cmsis_compiler.h
-keil_project\calculate.o: D:\software\keilv5\keilapp\ARM\AC5\Bin\..\include\stdint.h
+keil_project\calculate.o: D:\Keil_v5\ARM\ARMCC\Bin\..\include\stdint.h
 keil_project\calculate.o: ../Drivers/CMSIS/Include/cmsis_armcc.h
-keil_project\calculate.o: D:\software\keilv5\keilapp\ARM\AC5\Bin\..\include\string.h
-keil_project\calculate.o: D:\software\keilv5\keilapp\ARM\AC5\Bin\..\include\math.h
-keil_project\calculate.o: D:\software\keilv5\keilapp\ARM\AC5\Bin\..\include\float.h
-keil_project\calculate.o: D:\software\keilv5\keilapp\ARM\AC5\Bin\..\include\limits.h
+keil_project\calculate.o: D:\Keil_v5\ARM\ARMCC\Bin\..\include\string.h
+keil_project\calculate.o: D:\Keil_v5\ARM\ARMCC\Bin\..\include\math.h
+keil_project\calculate.o: D:\Keil_v5\ARM\ARMCC\Bin\..\include\float.h
+keil_project\calculate.o: D:\Keil_v5\ARM\ARMCC\Bin\..\include\limits.h
 keil_project\calculate.o: ..\myDrivers\calculatepo2\calculate.h

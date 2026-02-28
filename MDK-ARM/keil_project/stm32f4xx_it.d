@@ -7,7 +7,7 @@ keil_project\stm32f4xx_it.o: ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_d
 keil_project\stm32f4xx_it.o: ../Drivers/CMSIS/Device/ST/STM32F4xx/Include/stm32f4xx.h
 keil_project\stm32f4xx_it.o: ../Drivers/CMSIS/Device/ST/STM32F4xx/Include/stm32f405xx.h
 keil_project\stm32f4xx_it.o: ../Drivers/CMSIS/Include/core_cm4.h
-keil_project\stm32f4xx_it.o: D:\software\keilv5\keilapp\ARM\AC5\Bin\..\include\stdint.h
+keil_project\stm32f4xx_it.o: D:\Keil_v5\ARM\ARMCC\Bin\..\include\stdint.h
 keil_project\stm32f4xx_it.o: ../Drivers/CMSIS/Include/cmsis_version.h
 keil_project\stm32f4xx_it.o: ../Drivers/CMSIS/Include/cmsis_compiler.h
 keil_project\stm32f4xx_it.o: ../Drivers/CMSIS/Include/cmsis_armcc.h
@@ -15,7 +15,7 @@ keil_project\stm32f4xx_it.o: ../Drivers/CMSIS/Include/mpu_armv7.h
 keil_project\stm32f4xx_it.o: ../Drivers/CMSIS/Device/ST/STM32F4xx/Include/system_stm32f4xx.h
 keil_project\stm32f4xx_it.o: ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal.h
 keil_project\stm32f4xx_it.o: ../Drivers/STM32F4xx_HAL_Driver/Inc/Legacy/stm32_hal_legacy.h
-keil_project\stm32f4xx_it.o: D:\software\keilv5\keilapp\ARM\AC5\Bin\..\include\stddef.h
+keil_project\stm32f4xx_it.o: D:\Keil_v5\ARM\ARMCC\Bin\..\include\stddef.h
 keil_project\stm32f4xx_it.o: ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_rcc_ex.h
 keil_project\stm32f4xx_it.o: ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_gpio.h
 keil_project\stm32f4xx_it.o: ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_gpio_ex.h
@@ -35,5 +35,5 @@ keil_project\stm32f4xx_it.o: ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_s
 keil_project\stm32f4xx_it.o: ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_uart.h
 keil_project\stm32f4xx_it.o: ../Core/Inc/stm32f4xx_it.h
 keil_project\stm32f4xx_it.o: ../myDrivers/afe4490/afe4490.h
-keil_project\stm32f4xx_it.o: D:\software\keilv5\keilapp\ARM\AC5\Bin\..\include\string.h
+keil_project\stm32f4xx_it.o: D:\Keil_v5\ARM\ARMCC\Bin\..\include\string.h
 keil_project\stm32f4xx_it.o: ../myDrivers/Queue/Queue.h
